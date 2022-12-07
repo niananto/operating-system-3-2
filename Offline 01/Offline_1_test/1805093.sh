@@ -30,12 +30,12 @@ for dir in *; do
     a=$(ls -1 $dir | wc -l)
     if [[ $a == 0 ]]; then
         # zero marks
-        # echo "No file inside the directory $dir"
+        echo "No file inside the directory $dir"
         marks[$dir]=0
         continue
     elif [[ $a > 1 ]]; then
         # what to do?
-        # echo "More than one file submitted in $dir"
+        echo "More than one file submitted in $dir"
         marks[$dir]=0
         continue
     fi
@@ -43,7 +43,7 @@ for dir in *; do
     b=$(ls -1 $dir/*.sh | wc -l )
     if [[ $b != 1 ]]; then
         # zero marks
-        # echo "No .sh file in $dir"
+        echo "No .sh file in $dir"
         marks[$dir]=0
         continue        
     fi
@@ -52,7 +52,7 @@ for dir in *; do
     c=$(ls -1 *.sh)
     if [[ ${c: 0:-3} != $dir ]]; then
         # zero marks
-        # echo "Directory name $dir and file name $c don't match"
+        echo "Directory name $dir and file name $c don't match"
         marks[$dir]=0
         cd ..
         continue
@@ -67,7 +67,7 @@ for dir in *; do
     e=$(diff -w ../AcceptedOutput.txt ../temp_outputs/$d | grep [\<\>] | wc -l)
     ((score = max_score - e*5))
     ((score = score<0 ? 0 : score))
-    # echo "$score"
+    echo "$dir got $score"
     marks[$dir]=$score
 
     # copy-checker
@@ -78,7 +78,8 @@ for dir in *; do
             if [[ $f == 0 ]]; then
                 ((marks[$dir] = marks[$dir] < -marks[$dir] ? marks[$dir] : -marks[$dir]))
                 ((marks[$g] = marks[$g] < -marks[$g] ? marks[$g] : -marks[$g]))
-                # echo "$dir and $g are same"
+                echo "$dir and $g are same"
+                echo "$dir got ${marks[$dir]} and $g got ${marks[$g]}"
             fi
         done
     fi
