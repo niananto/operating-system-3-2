@@ -322,6 +322,8 @@ fork(void)
   np->state = RUNNABLE;
   release(&np->lock);
 
+  np->traced_sys_id = 0;
+
   return pid;
 }
 
@@ -680,4 +682,41 @@ procdump(void)
     printf("%d %s %s", p->pid, state, p->name);
     printf("\n");
   }
+}
+
+// trace how many times a system call occured
+// in a program run within it
+int
+trace(int sys_id)
+{
+  if (sys_id > 0 && sys_id < 22) {
+    struct proc *p = myproc();
+    p->traced_sys_id = sys_id;
+    return 0;
+  }
+  printf("invalid system call id\n");
+  printf("should be within 1 to 21\n");
+  return -1;
+}
+
+// print system memory info and process info
+int
+sysinfo(void)
+{
+  int running_proc = 0;
+
+  // calculate running process
+  struct proc *p;
+  for(p = proc; p < &proc[NPROC]; p++){
+    acquire(&p->lock);
+    if(p->state != UNUSED){
+      running_proc++;
+    }
+    release(&p->lock);
+  }
+
+  printf("\nsysinfo system call prints:\n");
+  printf("free-memory: %d bytes\n", get_free_mem());
+  printf("n_proc  : %d\n\n", running_proc);
+  return 0;
 }

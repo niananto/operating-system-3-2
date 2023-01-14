@@ -89,3 +89,18 @@ sys_uptime(void)
   release(&tickslock);
   return xticks;
 }
+
+// call trace in kernel/proc.c
+uint64
+sys_trace(void)
+{
+	int sys_id;
+	argint(0, &sys_id);
+	return trace(sys_id);
+}
+
+uint64
+sys_sysinfo(void)
+{
+  return sysinfo();
+}
