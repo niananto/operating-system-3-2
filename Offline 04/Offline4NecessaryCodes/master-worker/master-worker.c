@@ -7,7 +7,7 @@
 #include <wait.h>
 #include <pthread.h>
 
-int item_to_produce, item_to_consume, curr_buf_size;
+int produced_items, consumed_items, curr_buf_size;
 int total_items, max_buf_size, num_workers, num_masters;
 
 int *buffer;
@@ -30,22 +30,63 @@ pthread_cond_t buffer_not_empty = PTHREAD_COND_INITIALIZER;
 // every item should be produced exactly once
 // must only use pthreads condition variables for waiting and signaling
 // busy waiting is not allowed
+
+void do_fill(int value) {
+  // the idea of iterating whole buffer is that
+  // as curr_buf_size is less than max_buf_size
+  // there must be one empty slot in the buffer
+  // otherwise, this function would not be called
+  // so iterating it once is enough
+  // cause we'll always find at least one empty slot
+  for (int i = 0; i < max_buf_size; i++) {
+    if (buffer[i] == -1) {
+      buffer[i] = value;
+      curr_buf_size++;
+      return;
+    }
+  }
+}
+
+int do_get() {
+  // similar to do_fill, we'll always find at least one
+  // non-empty slot in the buffer or this function would
+  // not be called
+  for (int i = 0; i < max_buf_size; i++) {
+    if (buffer[i] != -1) {
+      int ret = buffer[i];
+      buffer[i] = -1;
+      curr_buf_size--;
+      return ret;
+    }
+  }
+}
+
 void *generate_requests_loop(void *data) {
   int thread_id = *((int *)data);
 
   while (1) {
     pthread_mutex_lock(&buffer_lock);
-    if (item_to_produce >= total_items) {
+
+    if (produced_items == total_items) {
+      pthread_cond_broadcast(&buffer_not_empty);
       pthread_mutex_unlock(&buffer_lock);
-      break;
-    }
-    while (curr_buf_size == max_buf_size) {
-      pthread_cond_wait(&buffer_not_full, &buffer_lock);
+      return 0;
     }
 
-    buffer[curr_buf_size++] = item_to_produce;
-    print_produced(item_to_produce, thread_id);
-    item_to_produce++;
+    while (curr_buf_size == max_buf_size) {
+      pthread_cond_wait(&buffer_not_full, &buffer_lock);
+
+      if (produced_items == total_items) {
+        pthread_cond_broadcast(&buffer_not_empty);
+        pthread_mutex_unlock(&buffer_lock);
+        return 0;
+      }
+    }
+
+    do_fill(produced_items);
+    print_produced(produced_items, thread_id);
+    produced_items++;
+
     pthread_cond_signal(&buffer_not_empty);
     pthread_mutex_unlock(&buffer_lock);
   }
@@ -59,16 +100,27 @@ void *consume_requests_loop(void *data) {
 
   while (1) {
     pthread_mutex_lock(&buffer_lock);
-    if (item_to_consume >= total_items) {
+
+    if (consumed_items == total_items) {
+      pthread_cond_broadcast(&buffer_not_full);
       pthread_mutex_unlock(&buffer_lock);
-      break;
-    }
-    while (curr_buf_size == 0) {
-      pthread_cond_wait(&buffer_not_empty, &buffer_lock);
+      return 0;
     }
 
-    print_consumed(buffer[--curr_buf_size], thread_id);
-    item_to_consume++;
+    while (curr_buf_size == 0) {
+      pthread_cond_wait(&buffer_not_empty, &buffer_lock);
+
+      if (consumed_items == total_items) {
+        pthread_cond_broadcast(&buffer_not_full);
+        pthread_mutex_unlock(&buffer_lock);
+        return 0;
+      }
+    }
+
+    int item = do_get();
+    print_consumed(item, thread_id);
+    consumed_items++;
+    
     pthread_cond_signal(&buffer_not_full);
     pthread_mutex_unlock(&buffer_lock);
   }
@@ -85,8 +137,8 @@ int main(int argc, char *argv[])
   pthread_t *master_thread;
   int *worker_thread_id;
   pthread_t *worker_thread;
-  item_to_produce = 0;
-  item_to_consume = 0;
+  produced_items = 0;
+  consumed_items = 0;
   curr_buf_size = 0;
 
   int i;
@@ -103,6 +155,8 @@ int main(int argc, char *argv[])
   }
 
   buffer = (int *)malloc(sizeof(int) * max_buf_size);
+  for (int i = 0; i < max_buf_size; i++)
+    buffer[i] = -1;
 
   // create master producer threads
   master_thread_id = (int *)malloc(sizeof(int) * num_masters);
