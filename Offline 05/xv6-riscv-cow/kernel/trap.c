@@ -29,6 +29,53 @@ trapinithart(void)
   w_stvec((uint64)kernelvec);
 }
 
+// helper cow methods to be used in usertrap()
+int
+cowpage(pagetable_t pagetable, uint64 va)
+{
+  if(va >= MAXVA) return -1;
+  pte_t *pte = walk(pagetable, va, 0);
+  if(pte == 0) return -1;
+  if((*pte & PTE_V) == 0) return -1;
+  return (*pte & PTE_COW) ? 0 : -1;
+}
+
+
+// I don't clearly understand what this method is doing
+void*
+cowalloc(pagetable_t pagetable, uint64 va)
+{
+  if(va % PGSIZE != 0) return 0;
+
+  uint64 pa = walkaddr(pagetable, va);
+  if(pa == 0) return 0;
+
+  pte_t *pte = walk(pagetable, va, 0);
+  if(krefcnt((char *)pa) == 1){
+    *pte |= PTE_W;
+    *pte &= ~PTE_COW;
+    return (void *)pa;
+  
+  } else {
+    char *mem;
+    if((mem = kalloc()) == 0)
+      return 0;
+
+    memmove(mem, (char*)pa, PGSIZE);
+    *pte &= ~PTE_V;
+
+    if(mappages(pagetable, va, PGSIZE, 
+            (uint64)mem, (PTE_FLAGS(*pte) | PTE_W) & ~PTE_COW) != 0){
+      kfree(mem);
+      *pte |= PTE_V;
+      return 0;
+    }
+
+    kfree((char *)PGROUNDDOWN(pa));
+    return mem;
+  }
+}
+
 //
 // handle an interrupt, exception, or system call from user space.
 // called from trampoline.S
@@ -65,8 +112,22 @@ usertrap(void)
     intr_on();
 
     syscall();
+
   } else if((which_dev = devintr()) != 0){
     // ok
+
+  // 12: page fault caused by an instruction fetch
+  // 13: page fault caused by a read
+  // 15: page fault cause by a write
+  } else if(r_scause() == 13 || r_scause() == 15){
+
+    uint64 fault_va = PGROUNDDOWN(r_stval());
+    if(fault_va >= p->sz
+      || cowpage(p->pagetable, fault_va) != 0
+      || cowalloc(p->pagetable, PGROUNDDOWN(fault_va)) == 0){
+        setkilled(p);
+    }
+
   } else {
     printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
     printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());

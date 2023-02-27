@@ -1,0 +1,1306 @@
+diff --git a/Makefile b/Makefile
+index 39a99d7..b7772b7 100644
+--- a/Makefile
++++ b/Makefile
+@@ -132,6 +132,7 @@ UPROGS=\
+ 	$U/_grind\
+ 	$U/_wc\
+ 	$U/_zombie\
++	$U/_cowtest\
+ 
+ fs.img: mkfs/mkfs README $(UPROGS)
+ 	mkfs/mkfs fs.img README $(UPROGS)
+@@ -171,3 +172,17 @@ qemu-gdb: $K/kernel .gdbinit fs.img
+ 	@echo "*** Now run 'gdb' in another window." 1>&2
+ 	$(QEMU) $(QEMUOPTS) -S $(QEMUGDB)
+ 
++ifneq ($(V),@)
++GRADEFLAGS += -v
++endif
++
++print-gdbport:
++	@echo $(GDBPORT)
++
++grade:
++	@echo $(MAKE) clean
++	@$(MAKE) clean || \
++          (echo "'make clean' failed.  HINT: Do you have another running instance of xv6?" && exit 1)
++	./grade-lab-cow $(GRADEFLAGS)
++
++.PHONY: qemu qemu-gdb clean grade print-gdbport
+\ No newline at end of file
+diff --git a/grade-lab-cow b/grade-lab-cow
+new file mode 100755
+index 0000000..2972119
+--- /dev/null
++++ b/grade-lab-cow
+@@ -0,0 +1,55 @@
++#!/usr/bin/env python3
++
++import re
++from gradelib import *
++
++r = Runner(save("xv6.out"))
++
++@test(0, "running cowtest")
++def test_cowtest():
++    r.run_qemu(shell_script([
++        'cowtest'
++    ]))
++
++@test(30, "simple", parent=test_cowtest)
++def test_simple():
++    matches = re.findall("^simple: ok$", r.qemu.output, re.M)
++    assert_equal(len(matches), 2, "Number of appearances of 'simple: ok'")
++
++@test(30, "three", parent=test_cowtest)
++def test_three():
++    matches = re.findall("^three: ok$", r.qemu.output, re.M)
++    assert_equal(len(matches), 3, "Number of appearances of 'three: ok'")
++
++@test(20, "file", parent=test_cowtest)
++def test_file():
++    r.match('^file: ok$')
++
++@test(0, "usertests")
++def test_usertests():
++    r.run_qemu(shell_script([
++        'usertests'
++    ]), timeout=300)
++    r.match('^ALL TESTS PASSED$')
++
++def usertest_check(testcase, nextcase, output):
++    if not re.search(r'\ntest {}: [\s\S]*OK\ntest {}'.format(testcase, nextcase), output):
++        raise AssertionError('Failed ' + testcase)
++
++@test(5, "usertests: copyin", parent=test_usertests)
++def test_sbrkbugs():
++    usertest_check("copyin", "copyout", r.qemu.output)
++
++@test(5, "usertests: copyout", parent=test_usertests)
++def test_sbrkbugs():
++    usertest_check("copyout", "copyinstr1", r.qemu.output)
++
++@test(19, "usertests: all tests", parent=test_usertests)
++def test_usertests_all():
++    r.match('^ALL TESTS PASSED$')
++
++@test(1, "time")
++def test_time():
++    check_time()
++
++run_tests()
+\ No newline at end of file
+diff --git a/gradelib.py b/gradelib.py
+new file mode 100644
+index 0000000..694fe8d
+--- /dev/null
++++ b/gradelib.py
+@@ -0,0 +1,611 @@
++from __future__ import print_function
++
++import sys, os, re, time, socket, select, subprocess, errno, shutil, random, string
++from subprocess import check_call, Popen
++from optparse import OptionParser
++
++__all__ = []
++
++##################################################################
++# Test structure
++#
++
++__all__ += ["test", "end_part", "run_tests", "get_current_test"]
++
++TESTS = []
++TOTAL = POSSIBLE = 0
++PART_TOTAL = PART_POSSIBLE = 0
++CURRENT_TEST = None
++
++def test(points, title=None, parent=None):
++    """Decorator for declaring test functions.  If title is None, the
++    title of the test will be derived from the function name by
++    stripping the leading "test_" and replacing underscores with
++    spaces."""
++
++    def register_test(fn, title=title):
++        if not title:
++            assert fn.__name__.startswith("test_")
++            title = fn.__name__[5:].replace("_", " ")
++        if parent:
++            title = "  " + title
++
++        def run_test():
++            global TOTAL, POSSIBLE, CURRENT_TEST
++
++            # Handle test dependencies
++            if run_test.complete:
++                return run_test.ok
++            run_test.complete = True
++            parent_failed = False
++            if parent:
++                parent_failed = not parent()
++
++            # Run the test
++            fail = None
++            start = time.time()
++            CURRENT_TEST = run_test
++            sys.stdout.write("== Test %s == " % title)
++            if parent:
++                sys.stdout.write("\n")
++            sys.stdout.flush()
++            try:
++                if parent_failed:
++                    raise AssertionError('Parent failed: %s' % parent.__name__)
++                fn()
++            except AssertionError as e:
++                fail = str(e)
++
++            # Display and handle test result
++            POSSIBLE += points
++            if points:
++                print("%s: %s" % (title, \
++                    (color("red", "FAIL") if fail else color("green", "OK"))), end=' ')
++            if time.time() - start > 0.1:
++                print("(%.1fs)" % (time.time() - start), end=' ')
++            print()
++            if fail:
++                print("    %s" % fail.replace("\n", "\n    "))
++            else:
++                TOTAL += points
++            for callback in run_test.on_finish:
++                callback(fail)
++            CURRENT_TEST = None
++
++            run_test.ok = not fail
++            return run_test.ok
++
++        # Record test metadata on the test wrapper function
++        run_test.__name__ = fn.__name__
++        run_test.title = title
++        run_test.complete = False
++        run_test.ok = False
++        run_test.on_finish = []
++        TESTS.append(run_test)
++        return run_test
++    return register_test
++
++def end_part(name):
++    def show_part():
++        global PART_TOTAL, PART_POSSIBLE
++        print("Part %s score: %d/%d" % \
++            (name, TOTAL - PART_TOTAL, POSSIBLE - PART_POSSIBLE))
++        print()
++        PART_TOTAL, PART_POSSIBLE = TOTAL, POSSIBLE
++    show_part.title = ""
++    TESTS.append(show_part)
++
++def run_tests():
++    """Set up for testing and run the registered test functions."""
++
++    # Handle command line
++    global options
++    parser = OptionParser(usage="usage: %prog [-v] [filters...]")
++    parser.add_option("-v", "--verbose", action="store_true",
++                      help="print commands")
++    parser.add_option("--color", choices=["never", "always", "auto"],
++                      default="auto", help="never, always, or auto")
++    (options, args) = parser.parse_args()
++
++    # Start with a full build to catch build errors
++    make()
++
++    # Clean the file system if there is one
++    reset_fs()
++
++    # Run tests
++    limit = list(map(str.lower, args))
++    try:
++        for test in TESTS:
++            if not limit or any(l in test.title.lower() for l in limit):
++                test()
++        if not limit:
++            print("Score: %d/%d" % (TOTAL, POSSIBLE))
++    except KeyboardInterrupt:
++        pass
++    if TOTAL < POSSIBLE:
++        sys.exit(1)
++
++def get_current_test():
++    if not CURRENT_TEST:
++        raise RuntimeError("No test is running")
++    return CURRENT_TEST
++
++##################################################################
++# Assertions
++#
++
++__all__ += ["assert_equal", "assert_lines_match"]
++
++def assert_equal(got, expect, msg=""):
++    if got == expect:
++        return
++    if msg:
++        msg += "\n"
++    raise AssertionError("%sgot:\n  %s\nexpected:\n  %s" %
++                         (msg, str(got).replace("\n", "\n  "),
++                          str(expect).replace("\n", "\n  ")))
++
++def assert_lines_match(text, *regexps, **kw):
++    """Assert that all of regexps match some line in text.  If a 'no'
++    keyword argument is given, it must be a list of regexps that must
++    *not* match any line in text."""
++
++    def assert_lines_match_kw(no=[]):
++        return no
++    no = assert_lines_match_kw(**kw)
++
++    # Check text against regexps
++    lines = text.splitlines()
++    good = set()
++    bad = set()
++    for i, line in enumerate(lines):
++        if any(re.match(r, line) for r in regexps):
++            good.add(i)
++            regexps = [r for r in regexps if not re.match(r, line)]
++        if any(re.match(r, line) for r in no):
++            bad.add(i)
++
++    if not regexps and not bad:
++        return
++
++    # We failed; construct an informative failure message
++    show = set()
++    for lineno in good.union(bad):
++        for offset in range(-2, 3):
++            show.add(lineno + offset)
++    if regexps:
++        show.update(n for n in range(len(lines) - 5, len(lines)))
++
++    msg = []
++    last = -1
++    for lineno in sorted(show):
++        if 0 <= lineno < len(lines):
++            if lineno != last + 1:
++                msg.append("...")
++            last = lineno
++            msg.append("%s %s" % (color("red", "BAD ") if lineno in bad else
++                                  color("green", "GOOD") if lineno in good
++                                  else "    ",
++                                  lines[lineno]))
++    if last != len(lines) - 1:
++        msg.append("...")
++    if bad:
++        msg.append("unexpected lines in output")
++    for r in regexps:
++        msg.append(color("red", "MISSING") + " '%s'" % r)
++    raise AssertionError("\n".join(msg))
++
++##################################################################
++# Utilities
++#
++
++__all__ += ["make", "maybe_unlink", "reset_fs", "color", "random_str", "check_time", "check_answers"]
++
++MAKE_TIMESTAMP = 0
++
++def pre_make():
++    """Delay prior to running make to ensure file mtimes change."""
++    while int(time.time()) == MAKE_TIMESTAMP:
++        time.sleep(0.1)
++
++def post_make():
++    """Record the time after make completes so that the next run of
++    make can be delayed if needed."""
++    global MAKE_TIMESTAMP
++    MAKE_TIMESTAMP = int(time.time())
++
++def make(*target):
++    pre_make()
++    if Popen(("make",) + target).wait():
++        sys.exit(1)
++    post_make()
++
++def show_command(cmd):
++    from pipes import quote
++    print("\n$", " ".join(map(quote, cmd)))
++
++def maybe_unlink(*paths):
++    for path in paths:
++        try:
++            os.unlink(path)
++        except EnvironmentError as e:
++            if e.errno != errno.ENOENT:
++                raise
++
++COLORS = {"default": "\033[0m", "red": "\033[31m", "green": "\033[32m"}
++
++def color(name, text):
++    if options.color == "always" or (options.color == "auto" and os.isatty(1)):
++        return COLORS[name] + text + COLORS["default"]
++    return text
++
++def reset_fs():
++    if os.path.exists("obj/fs/clean-fs.img"):
++        shutil.copyfile("obj/fs/clean-fs.img", "obj/fs/fs.img")
++
++def random_str(n=8):
++    letters = string.ascii_letters + string.digits
++    return ''.join(random.choice(letters) for _ in range(n))
++
++def check_time():
++    try:
++        print("")
++        with open('time.txt') as f:
++            d = f.read().strip()
++            if not re.match(r'^\d+$', d):
++                raise AssertionError('time.txt does not contain a single integer (number of hours spent on the lab)')
++    except IOError:
++        raise AssertionError('Cannot read time.txt')
++
++def check_answers(file, n=10):
++    try:
++        with open(file) as f:
++            d = f.read().strip()
++            if len(d) < n:
++                raise AssertionError('%s does not seem to contain enough text' % file)
++    except IOError:
++        raise AssertionError('Cannot read %s' % file)
++
++
++##################################################################
++# Controllers
++#
++
++__all__ += ["QEMU", "GDBClient"]
++
++class QEMU(object):
++    _GDBPORT = None
++
++    def __init__(self, *make_args):
++        # Check that QEMU is not currently running
++        try:
++            GDBClient(self.get_gdb_port(), timeout=0).close()
++        except socket.error:
++            pass
++        else:
++            print("""\
++GDB stub found on port %d.
++QEMU appears to already be running.  Please exit it if possible or use
++'killall qemu' or 'killall qemu.real'.""" % self.get_gdb_port(), file=sys.stderr)
++            sys.exit(1)
++
++        if options.verbose:
++            show_command(("make",) + make_args)
++        cmd = ("make", "-s", "--no-print-directory") + make_args
++        self.proc = Popen(cmd, stdout=subprocess.PIPE,
++                          stderr=subprocess.STDOUT,
++                          stdin=subprocess.PIPE)
++        # Accumulated output as a string
++        self.output = ""
++        # Accumulated output as a bytearray
++        self.outbytes = bytearray()
++        self.on_output = []
++
++    @staticmethod
++    def get_gdb_port():
++        if QEMU._GDBPORT is None:
++            p = Popen(["make", "-s", "--no-print-directory", "print-gdbport"],
++                      stdout=subprocess.PIPE)
++            (out, _) = p.communicate()
++            if p.returncode:
++                raise RuntimeError(
++                    "Failed to get gdbport: make exited with %d" %
++                    p.returncode)
++            QEMU._GDBPORT = int(out)
++        return QEMU._GDBPORT
++
++    def fileno(self):
++        if self.proc:
++            return self.proc.stdout.fileno()
++
++    def handle_read(self):
++        buf = os.read(self.proc.stdout.fileno(), 4096)
++        self.outbytes.extend(buf)
++        self.output = self.outbytes.decode("utf-8", "replace")
++        for callback in self.on_output:
++            callback(buf)
++        if buf == b"":
++            self.wait()
++            return
++
++    def write(self, buf):
++        if isinstance(buf, str):
++            buf = buf.encode('utf-8')
++        self.proc.stdin.write(buf)
++        self.proc.stdin.flush()
++
++    def wait(self):
++        if self.proc:
++            self.proc.wait()
++            self.proc = None
++
++    def kill(self):
++        if self.proc:
++            self.proc.terminate()
++
++class GDBClient(object):
++    def __init__(self, port, timeout=15):
++        start = time.time()
++        while True:
++            self.sock = socket.socket()
++            try:
++                self.sock.settimeout(1)
++                self.sock.connect(("localhost", port))
++                break
++            except socket.error:
++                if time.time() >= start + timeout:
++                    raise
++        self.__buf = ""
++
++    def fileno(self):
++        if self.sock:
++            return self.sock.fileno()
++
++    def handle_read(self):
++        try:
++            data = self.sock.recv(4096).decode("ascii", "replace")
++        except socket.error:
++            data = ""
++        if data == "":
++            self.sock.close()
++            self.sock = None
++            return
++        self.__buf += data
++
++        while True:
++            m = re.search(r"\$([^#]*)#[0-9a-zA-Z]{2}", self.__buf)
++            if not m:
++                break
++            pkt = m.group(1)
++            self.__buf = self.__buf[m.end():]
++
++            if pkt.startswith("T05"):
++                # Breakpoint
++                raise TerminateTest
++
++    def __send(self, cmd):
++        packet = "$%s#%02x" % (cmd, sum(map(ord, cmd)) % 256)
++        self.sock.sendall(packet.encode("ascii"))
++
++    def __send_break(self):
++        self.sock.sendall(b"\x03")
++
++    def close(self):
++        if self.sock:
++            self.sock.close()
++            self.sock = None
++
++    def cont(self):
++        self.__send("c")
++
++    def breakpoint(self, addr):
++        self.__send("Z1,%x,1" % addr)
++
++
++##################################################################
++# QEMU test runner
++#
++
++__all__ += ["TerminateTest", "Runner"]
++
++class TerminateTest(Exception):
++    pass
++
++class Runner():
++    def __init__(self, *default_monitors):
++        self.__default_monitors = default_monitors
++
++    def run_qemu(self, *monitors, **kw):
++        """Run a QEMU-based test.  monitors should functions that will
++        be called with this Runner instance once QEMU and GDB are
++        started.  Typically, they should register callbacks that throw
++        TerminateTest when stop events occur.  The target_base
++        argument gives the make target to run.  The make_args argument
++        should be a list of additional arguments to pass to make.  The
++        timeout argument bounds how long to run before returning."""
++
++        def run_qemu_kw(target_base="qemu", make_args=[], timeout=30):
++            return target_base, make_args, timeout
++        target_base, make_args, timeout = run_qemu_kw(**kw)
++
++        # Start QEMU
++        pre_make()
++        self.qemu = QEMU(target_base + "-gdb", *make_args)
++        self.gdb = None
++
++        try:
++            # Wait for QEMU to start or make to fail.  This will set
++            # self.gdb if QEMU starts.
++            self.qemu.on_output = [self.__monitor_start]
++            self.__react([self.qemu], timeout=90)
++            self.qemu.on_output = []
++            if self.gdb is None:
++                print("Failed to connect to QEMU; output:")
++                print(self.qemu.output)
++                sys.exit(1)
++            post_make()
++
++            # QEMU and GDB are up
++            self.reactors = [self.qemu, self.gdb]
++
++            # Start monitoring
++            for m in self.__default_monitors + monitors:
++                m(self)
++
++            # Run and react
++            self.gdb.cont()
++            self.__react(self.reactors, timeout)
++        finally:
++            # Shutdown QEMU
++            try:
++                if self.gdb is None:
++                    sys.exit(1)
++                self.qemu.kill()
++                self.__react(self.reactors, 5)
++                self.gdb.close()
++                self.qemu.wait()
++            except:
++                print("""\
++Failed to shutdown QEMU.  You might need to 'killall qemu' or
++'killall qemu.real'.
++""")
++                raise
++
++    def __monitor_start(self, output):
++        if b"\n" in output:
++            try:
++                self.gdb = GDBClient(self.qemu.get_gdb_port(), timeout=2)
++                raise TerminateTest
++            except socket.error:
++                pass
++        if not len(output):
++            raise TerminateTest
++
++    def __react(self, reactors, timeout):
++        deadline = time.time() + timeout
++        try:
++            while True:
++                timeleft = deadline - time.time() + 100
++                if timeleft < 0:
++                    sys.stdout.write("Timeout! ")
++                    sys.stdout.flush()
++                    return
++
++                rset = [r for r in reactors if r.fileno() is not None]
++                if not rset:
++                    return
++
++                rset, _, _ = select.select(rset, [], [], timeleft)
++                for reactor in rset:
++                    reactor.handle_read()
++        except TerminateTest:
++            pass
++
++    def user_test(self, binary, *monitors, **kw):
++        """Run a user test using the specified binary.  Monitors and
++        keyword arguments are as for run_qemu.  This runs on a disk
++        snapshot unless the keyword argument 'snapshot' is False."""
++
++        maybe_unlink("obj/kern/init.o", "obj/kern/kernel")
++        if kw.pop("snapshot", True):
++            kw.setdefault("make_args", []).append("QEMUEXTRA+=-snapshot")
++        self.run_qemu(target_base="run-%s" % binary, *monitors, **kw)
++
++    def match(self, *args, **kwargs):
++        """Shortcut to call assert_lines_match on the most recent QEMU
++        output."""
++
++        assert_lines_match(self.qemu.output, *args, **kwargs)
++
++##################################################################
++# Monitors
++#
++
++__all__ += ["save", "stop_breakpoint", "call_on_line", "stop_on_line", "shell_script"]
++
++def save(path):
++    """Return a monitor that writes QEMU's output to path.  If the
++    test fails, copy the output to path.test-name."""
++
++    def setup_save(runner):
++        f.seek(0)
++        f.truncate()
++        runner.qemu.on_output.append(f.write)
++        get_current_test().on_finish.append(save_on_finish)
++
++    def save_on_finish(fail):
++        f.flush()
++        save_path = path + "." + get_current_test().__name__[5:]
++        if fail:
++            shutil.copyfile(path, save_path)
++            print("    QEMU output saved to %s" % save_path)
++        elif os.path.exists(save_path):
++            os.unlink(save_path)
++            print("    (Old %s failure log removed)" % save_path)
++
++    f = open(path, "wb")
++    return setup_save
++
++def stop_breakpoint(addr):
++    """Returns a monitor that stops when addr is reached.  addr may be
++    a number or the name of a symbol."""
++
++    def setup_breakpoint(runner):
++        if isinstance(addr, str):
++            addrs = [int(sym[:16], 16) for sym in open("kernel/kernel.sym")
++                     if sym[17:].strip() == addr]
++            assert len(addrs), "Symbol %s not found" % addr
++            runner.gdb.breakpoint(addrs[0])
++        else:
++            runner.gdb.breakpoint(addr)
++    return setup_breakpoint
++
++def call_on_line(regexp, callback):
++    """Returns a monitor that calls 'callback' when QEMU prints a line
++    matching 'regexp'."""
++
++    def setup_call_on_line(runner):
++        buf = bytearray()
++        def handle_output(output):
++            buf.extend(output)
++            while b"\n" in buf:
++                line, buf[:] = buf.split(b"\n", 1)
++                line = line.decode("utf-8", "replace")
++                if re.match(regexp, line):
++                    callback(line)
++        runner.qemu.on_output.append(handle_output)
++    return setup_call_on_line
++
++def stop_on_line(regexp):
++    """Returns a monitor that stops when QEMU prints a line matching
++    'regexp'."""
++
++    def stop(line):
++        raise TerminateTest
++    return call_on_line(regexp, stop)
++
++def shell_script(script, terminate_match=None):
++    """Returns a monitor that plays the script, and stops when the script is
++    done executing."""
++
++    def setup_call_on_line(runner):
++        class context:
++            n = 0
++            buf = bytearray()
++        def handle_output(output):
++            context.buf.extend(output)
++            if terminate_match is not None:
++                if re.match(terminate_match, context.buf.decode('utf-8', 'replace')):
++                    raise TerminateTest
++            if b'$ ' in context.buf:
++                context.buf = bytearray()
++                if context.n < len(script):
++                    runner.qemu.write(script[context.n])
++                    runner.qemu.write('\n')
++                    context.n += 1
++                else:
++                    if terminate_match is None:
++                        raise TerminateTest
++        runner.qemu.on_output.append(handle_output)
++    return setup_call_on_line
+\ No newline at end of file
+diff --git a/kernel/defs.h b/kernel/defs.h
+index a3c962b..27af922 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -63,6 +63,8 @@ void            ramdiskrw(struct buf*);
+ void*           kalloc(void);
+ void            kfree(void *);
+ void            kinit(void);
++int             krefcnt(void*);
++int             kaddrefcnt(void*);
+ 
+ // log.c
+ void            initlog(int, struct superblock*);
+@@ -147,6 +149,8 @@ void            trapinit(void);
+ void            trapinithart(void);
+ extern struct spinlock tickslock;
+ void            usertrapret(void);
++int             cowpage(pagetable_t, uint64);
++void*           cowalloc(pagetable_t, uint64);
+ 
+ // uart.c
+ void            uartinit(void);
+diff --git a/kernel/kalloc.c b/kernel/kalloc.c
+index 0699e7e..9472dfe 100644
+--- a/kernel/kalloc.c
++++ b/kernel/kalloc.c
+@@ -23,10 +23,22 @@ struct {
+   struct run *freelist;
+ } kmem;
+ 
++struct {
++  struct spinlock lock;
++  int cnt [PHYSTOP / PGSIZE]; // should I use (PHYSTOP-KERNBASE) / PGSIZE?
++} ref;
++
++int
++krefcnt(void* pa)
++{
++  return ref.cnt[(uint64)pa / PGSIZE]; // should I use ((uint64)pa - KERNBASE) / PGSIZE?
++}
++
+ void
+ kinit()
+ {
+   initlock(&kmem.lock, "kmem");
++  initlock(&ref.lock, "ref");
+   freerange(end, (void*)PHYSTOP);
+ }
+ 
+@@ -35,8 +47,10 @@ freerange(void *pa_start, void *pa_end)
+ {
+   char *p;
+   p = (char*)PGROUNDUP((uint64)pa_start);
+-  for(; p + PGSIZE <= (char*)pa_end; p += PGSIZE)
++  for(; p + PGSIZE <= (char*)pa_end; p += PGSIZE){
++    ref.cnt[(uint64)p / PGSIZE] = 1; // should I use ((uint64)p - KERNBASE) / PGSIZE?
+     kfree(p);
++  }
+ }
+ 
+ // Free the page of physical memory pointed at by pa,
+@@ -51,15 +65,25 @@ kfree(void *pa)
+   if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
+     panic("kfree");
+ 
+-  // Fill with junk to catch dangling refs.
+-  memset(pa, 1, PGSIZE);
++  acquire(&ref.lock);
++  --ref.cnt[(uint64)pa / PGSIZE]; // should I use ((uint64)pa - KERNBASE) / PGSIZE?
+ 
+-  r = (struct run*)pa;
++  if(ref.cnt[(uint64)pa / PGSIZE] == 0){
++    release(&ref.lock);
+ 
+-  acquire(&kmem.lock);
+-  r->next = kmem.freelist;
+-  kmem.freelist = r;
+-  release(&kmem.lock);
++    // Fill with junk to catch dangling refs.
++    memset(pa, 1, PGSIZE);
++
++    r = (struct run*)pa;
++
++    acquire(&kmem.lock);
++    r->next = kmem.freelist;
++    kmem.freelist = r;
++    release(&kmem.lock);
++
++  } else {
++    release(&ref.lock);
++  }
+ }
+ 
+ // Allocate one 4096-byte page of physical memory.
+@@ -72,11 +96,31 @@ kalloc(void)
+ 
+   acquire(&kmem.lock);
+   r = kmem.freelist;
+-  if(r)
++  if(r) {
+     kmem.freelist = r->next;
++    
++    acquire(&ref.lock);
++    ref.cnt[(uint64)r / PGSIZE] = 1; // should I use ((uint64)r - KERNBASE) / PGSIZE?
++    // should I use ++ or =1?
++    release(&ref.lock);
++  }
+   release(&kmem.lock);
+ 
+   if(r)
+     memset((char*)r, 5, PGSIZE); // fill with junk
+   return (void*)r;
+ }
++
++// when do I call this method?
++// uvm copy I guess
++int
++kaddrefcnt(void* pa)
++{
++  if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
++    return -1;
++
++  acquire(&ref.lock);
++  ++ref.cnt[(uint64)pa / PGSIZE]; // should I use ((uint64)pa - KERNBASE) / PGSIZE?
++  release(&ref.lock);
++  return 0;
++}
+diff --git a/kernel/riscv.h b/kernel/riscv.h
+index 20a01db..48c36fb 100644
+--- a/kernel/riscv.h
++++ b/kernel/riscv.h
+@@ -344,6 +344,8 @@ typedef uint64 *pagetable_t; // 512 PTEs
+ #define PTE_X (1L << 3)
+ #define PTE_U (1L << 4) // user can access
+ 
++#define PTE_COW (1L << 8) // copy-on-write
++
+ // shift a physical address to the right place for a PTE.
+ #define PA2PTE(pa) ((((uint64)pa) >> 12) << 10)
+ 
+diff --git a/kernel/trap.c b/kernel/trap.c
+index 512c850..fbd05f7 100644
+--- a/kernel/trap.c
++++ b/kernel/trap.c
+@@ -29,6 +29,53 @@ trapinithart(void)
+   w_stvec((uint64)kernelvec);
+ }
+ 
++// helper cow methods to be used in usertrap()
++int
++cowpage(pagetable_t pagetable, uint64 va)
++{
++  if(va >= MAXVA) return -1;
++  pte_t *pte = walk(pagetable, va, 0);
++  if(pte == 0) return -1;
++  if((*pte & PTE_V) == 0) return -1;
++  return (*pte & PTE_COW) ? 0 : -1;
++}
++
++
++// I don't clearly understand what this method is doing
++void*
++cowalloc(pagetable_t pagetable, uint64 va)
++{
++  if(va % PGSIZE != 0) return 0;
++
++  uint64 pa = walkaddr(pagetable, va);
++  if(pa == 0) return 0;
++
++  pte_t *pte = walk(pagetable, va, 0);
++  if(krefcnt((char *)pa) == 1){
++    *pte |= PTE_W;
++    *pte &= ~PTE_COW;
++    return (void *)pa;
++  
++  } else {
++    char *mem;
++    if((mem = kalloc()) == 0)
++      return 0;
++
++    memmove(mem, (char*)pa, PGSIZE);
++    *pte &= ~PTE_V;
++
++    if(mappages(pagetable, va, PGSIZE, 
++            (uint64)mem, (PTE_FLAGS(*pte) | PTE_W) & ~PTE_COW) != 0){
++      kfree(mem);
++      *pte |= PTE_V;
++      return 0;
++    }
++
++    kfree((char *)PGROUNDDOWN(pa));
++    return mem;
++  }
++}
++
+ //
+ // handle an interrupt, exception, or system call from user space.
+ // called from trampoline.S
+@@ -65,8 +112,22 @@ usertrap(void)
+     intr_on();
+ 
+     syscall();
++
+   } else if((which_dev = devintr()) != 0){
+     // ok
++
++  // 12: page fault caused by an instruction fetch
++  // 13: page fault caused by a read
++  // 15: page fault cause by a write
++  } else if(r_scause() == 13 || r_scause() == 15){
++
++    uint64 fault_va = PGROUNDDOWN(r_stval());
++    if(fault_va >= p->sz
++      || cowpage(p->pagetable, fault_va) != 0
++      || cowalloc(p->pagetable, PGROUNDDOWN(fault_va)) == 0){
++        setkilled(p);
++    }
++
+   } else {
+     printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
+     printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
+diff --git a/kernel/vm.c b/kernel/vm.c
+index 9f69783..60b06a6 100644
+--- a/kernel/vm.c
++++ b/kernel/vm.c
+@@ -308,7 +308,7 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
+   pte_t *pte;
+   uint64 pa, i;
+   uint flags;
+-  char *mem;
++  // char *mem;
+ 
+   for(i = 0; i < sz; i += PGSIZE){
+     if((pte = walk(old, i, 0)) == 0)
+@@ -317,14 +317,27 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
+       panic("uvmcopy: page not present");
+     pa = PTE2PA(*pte);
+     flags = PTE_FLAGS(*pte);
+-    if((mem = kalloc()) == 0)
++    // if((mem = kalloc()) == 0)
++    //   goto err;
++    // memmove(mem, (char*)pa, PGSIZE);
++    // if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
++    //   kfree(mem);
++    //   goto err;
++    // }
++
++    if (flags & PTE_W) {
++      flags = (flags | PTE_COW) & ~PTE_W;
++      *pte = PA2PTE(pa) | flags; // does this make sure the old page is read-only?
++    }
++
++    if(mappages(new, i, PGSIZE, pa, flags) != 0)
+       goto err;
+-    memmove(mem, (char*)pa, PGSIZE);
+-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
+-      kfree(mem);
++
++    // add ref to the page
++    if(kaddrefcnt((void *)pa) < 0)
+       goto err;
+-    }
+   }
++
+   return 0;
+ 
+  err:
+@@ -348,6 +361,12 @@ uvmclear(pagetable_t pagetable, uint64 va)
+ // Copy from kernel to user.
+ // Copy len bytes from src to virtual address dstva in a given page table.
+ // Return 0 on success, -1 on error.
++
++// only needs to be changed copyoutbut not copyinbecause the former is 
++// copied from the kernel to the user, which will generate a write 
++// operation on a user page, while the latter is copied from the user to 
++// the kernel, just to read the content of the user page, and the COW 
++// page is allowed to read.
+ int
+ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
+ {
+@@ -356,6 +375,12 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
+   while(len > 0){
+     va0 = PGROUNDDOWN(dstva);
+     pa0 = walkaddr(pagetable, va0);
++
++    // if it is a COW page, replace the pa0 pointed phy addr
++    if(cowpage(pagetable, va0) == 0){
++      pa0 = (uint64)cowalloc(pagetable, va0);
++    }
++
+     if(pa0 == 0)
+       return -1;
+     n = PGSIZE - (dstva - va0);
+diff --git a/time.txt b/time.txt
+new file mode 100644
+index 0000000..5e61934
+--- /dev/null
++++ b/time.txt
+@@ -0,0 +1 @@
++121212121212121212121212
+\ No newline at end of file
+diff --git a/user/cowtest.c b/user/cowtest.c
+new file mode 100644
+index 0000000..098f515
+--- /dev/null
++++ b/user/cowtest.c
+@@ -0,0 +1,197 @@
++//
++// tests for copy-on-write fork() assignment.
++//
++
++#include "kernel/types.h"
++#include "kernel/memlayout.h"
++#include "user/user.h"
++
++// allocate more than half of physical memory,
++// then fork. this will fail in the default
++// kernel, which does not support copy-on-write.
++void
++simpletest()
++{
++  uint64 phys_size = PHYSTOP - KERNBASE;
++  int sz = (phys_size / 3) * 2;
++
++  printf("simple: ");
++  
++  char *p = sbrk(sz);
++  if(p == (char*)0xffffffffffffffffL){
++    printf("sbrk(%d) failed\n", sz);
++    exit(-1);
++  }
++
++  for(char *q = p; q < p + sz; q += 4096){
++    *(int*)q = getpid();
++  }
++
++  int pid = fork();
++  if(pid < 0){
++    printf("fork() failed\n");
++    exit(-1);
++  }
++
++  if(pid == 0)
++    exit(0);
++
++  wait(0);
++
++  if(sbrk(-sz) == (char*)0xffffffffffffffffL){
++    printf("sbrk(-%d) failed\n", sz);
++    exit(-1);
++  }
++
++  printf("ok\n");
++}
++
++// three processes all write COW memory.
++// this causes more than half of physical memory
++// to be allocated, so it also checks whether
++// copied pages are freed.
++void
++threetest()
++{
++  uint64 phys_size = PHYSTOP - KERNBASE;
++  int sz = phys_size / 4;
++  int pid1, pid2;
++
++  printf("three: ");
++  
++  char *p = sbrk(sz);
++  if(p == (char*)0xffffffffffffffffL){
++    printf("sbrk(%d) failed\n", sz);
++    exit(-1);
++  }
++
++  pid1 = fork();
++  if(pid1 < 0){
++    printf("fork failed\n");
++    exit(-1);
++  }
++  if(pid1 == 0){
++    pid2 = fork();
++    if(pid2 < 0){
++      printf("fork failed");
++      exit(-1);
++    }
++    if(pid2 == 0){
++      for(char *q = p; q < p + (sz/5)*4; q += 4096){
++        *(int*)q = getpid();
++      }
++      for(char *q = p; q < p + (sz/5)*4; q += 4096){
++        if(*(int*)q != getpid()){
++          printf("wrong content\n");
++          exit(-1);
++        }
++      }
++      exit(-1);
++    }
++    for(char *q = p; q < p + (sz/2); q += 4096){
++      *(int*)q = 9999;
++    }
++    exit(0);
++  }
++
++  for(char *q = p; q < p + sz; q += 4096){
++    *(int*)q = getpid();
++  }
++
++  wait(0);
++
++  sleep(1);
++
++  for(char *q = p; q < p + sz; q += 4096){
++    if(*(int*)q != getpid()){
++      printf("wrong content\n");
++      exit(-1);
++    }
++  }
++
++  if(sbrk(-sz) == (char*)0xffffffffffffffffL){
++    printf("sbrk(-%d) failed\n", sz);
++    exit(-1);
++  }
++
++  printf("ok\n");
++}
++
++char junk1[4096];
++int fds[2];
++char junk2[4096];
++char buf[4096];
++char junk3[4096];
++
++// test whether copyout() simulates COW faults.
++void
++filetest()
++{
++  printf("file: ");
++  
++  buf[0] = 99;
++
++  for(int i = 0; i < 4; i++){
++    if(pipe(fds) != 0){
++      printf("pipe() failed\n");
++      exit(-1);
++    }
++    int pid = fork();
++    if(pid < 0){
++      printf("fork failed\n");
++      exit(-1);
++    }
++    if(pid == 0){
++      sleep(1);
++      if(read(fds[0], buf, sizeof(i)) != sizeof(i)){
++        printf("error: read failed\n");
++        exit(1);
++      }
++      sleep(1);
++      int j = *(int*)buf;
++      if(j != i){
++        printf("error: read the wrong value\n");
++        exit(1);
++      }
++      exit(0);
++    }
++    if(write(fds[1], &i, sizeof(i)) != sizeof(i)){
++      printf("error: write failed\n");
++      exit(-1);
++    }
++  }
++
++  int xstatus = 0;
++  for(int i = 0; i < 4; i++) {
++    wait(&xstatus);
++    if(xstatus != 0) {
++      exit(1);
++    }
++  }
++
++  if(buf[0] != 99){
++    printf("error: child overwrote parent\n");
++    exit(1);
++  }
++
++  printf("ok\n");
++}
++
++int
++main(int argc, char *argv[])
++{
++  simpletest();
++
++  // check that the first simpletest() freed the physical memory.
++  simpletest();
++
++  threetest();
++  threetest();
++  threetest();
++
++  filetest();
++
++  printf("ALL COW TESTS PASSED\n");
++
++  exit(0);
++}
+\ No newline at end of file
+diff --git a/xv6.out b/xv6.out
+new file mode 100644
+index 0000000..49b22f9
+--- /dev/null
++++ b/xv6.out
+@@ -0,0 +1,84 @@
++
++xv6 kernel is booting
++
++hart 2 starting
++hart 1 starting
++init: starting sh
++$ usertests
++usertests starting
++test copyin: OK
++test copyout: OK
++test copyinstr1: OK
++test copyinstr2: OK
++test copyinstr3: OK
++test rwsbrk: OK
++test truncate1: OK
++test truncate2: OK
++test truncate3: OK
++test openiput: OK
++test exitiput: OK
++test iput: OK
++test opentest: OK
++test writetest: OK
++test writebig: OK
++test createtest: OK
++test dirtest: OK
++test exectest: OK
++test pipe1: OK
++test killstatus: OK
++test preempt: kill... wait... OK
++test exitwait: OK
++test reparent: OK
++test twochildren: OK
++test forkfork: OK
++test forkforkfork: OK
++test reparent2: OK
++test mem: OK
++test sharedfd: OK
++test fourfiles: OK
++test createdelete: OK
++test unlinkread: OK
++test linktest: OK
++test concreate: OK
++test linkunlink: OK
++test subdir: OK
++test bigwrite: OK
++test bigfile: OK
++test fourteen: OK
++test rmdot: OK
++test dirfile: OK
++test iref: OK
++test forktest: OK
++test sbrkbasic: OK
++test sbrkmuch: OK
++test kernmem: OK
++test MAXVAplus: OK
++test sbrkfail: OK
++test sbrkarg: OK
++test validatetest: OK
++test bsstest: OK
++test bigargtest: OK
++test argptest: OK
++test stacktest: OK
++test textwrite: OK
++test pgbug: OK
++test sbrkbugs: usertrap(): unexpected scause 0x000000000000000c pid=6566
++            sepc=0x0000000000005c5e stval=0x0000000000005c5e
++usertrap(): unexpected scause 0x000000000000000c pid=6567
++            sepc=0x0000000000005c5e stval=0x0000000000005c5e
++OK
++test sbrklast: OK
++test sbrk8000: OK
++test badarg: OK
++usertests slow tests starting
++test bigdir: OK
++test manywrites: OK
++test badwrite: OK
++test execout: OK
++test diskfull: balloc: out of blocks
++ialloc: no inodes
++OK
++test outofinodes: ialloc: no inodes
++OK
++ALL TESTS PASSED
++$ qemu-system-riscv64: terminating on signal 15 from pid 13147 (make)
